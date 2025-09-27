@@ -108,13 +108,22 @@ class TestDataGenerator:
         self._init_buyer_seller_config()
         
     def _init_buyer_seller_config(self):
-        """初始化买卖方配置"""
-        self.hot_buyers = list(range(1, 11))  # Top 10买方
-        self.hot_sellers = list(range(1, 11))  # Top 10卖方
-        self.regular_buyers = list(range(11, 111))  # Top 100买方
-        self.regular_sellers = list(range(11, 111))  # Top 100卖方
-        self.all_buyers = list(range(1, 1001))  # 所有买方
-        self.all_sellers = list(range(1, 1001))  # 所有卖方
+        """
+        初始化买卖方配置（优化版）
+        减少组合数量，增加数据密度，提高匹配率
+        """
+        # 优化后的配置：更少的买卖方，更高的密度
+        self.hot_buyers = list(range(1, 11))      # Top 10买方 (40%概率)
+        self.hot_sellers = list(range(1, 11))     # Top 10卖方
+        self.regular_buyers = list(range(11, 51))  # Top 50买方 (40%概率，原来是100)
+        self.regular_sellers = list(range(11, 51)) # Top 50卖方
+        self.all_buyers = list(range(1, 101))     # 所有100个买方 (20%概率，原来是1000)
+        self.all_sellers = list(range(1, 101))    # 所有100个卖方
+
+        print(f"📊 数据分布配置:")
+        print(f"  热门买卖方: {len(self.hot_buyers)}x{len(self.hot_sellers)} = {len(self.hot_buyers)*len(self.hot_sellers)} 组合")
+        print(f"  常规买卖方: {len(self.regular_buyers)}x{len(self.regular_sellers)} = {len(self.regular_buyers)*len(self.regular_sellers)} 组合")
+        print(f"  全部买卖方: {len(self.all_buyers)}x{len(self.all_sellers)} = {len(self.all_buyers)*len(self.all_sellers)} 组合")
     
     def setup_database(self):
         """设置数据库：创建表和索引"""
@@ -205,7 +214,7 @@ class TestDataGenerator:
         生成单条蓝票行数据
         复用之前的数据生成逻辑，增加batch_id
         """
-        tax_rate = np.random.choice(self.tax_rates, p=self.tax_weights)
+        tax_rate = int(np.random.choice(self.tax_rates, p=self.tax_weights))  # 转换为Python int
         buyer_id, seller_id = self.generate_buyer_seller()
         remaining = self.generate_remaining_amount()
         original_amount = remaining * random.uniform(1.2, 2.0) if remaining > 0 else random.uniform(100, 1000)
@@ -236,15 +245,18 @@ class TestDataGenerator:
             return round(random.uniform(1000, 5000), 2)
     
     def generate_buyer_seller(self):
-        """生成买卖方组合"""
+        """
+        生成买卖方组合（优化版）
+        调整概率分布，增加热门组合密度
+        """
         rand = random.random()
-        if rand < 0.30:  # 30% 热门组合
+        if rand < 0.40:  # 40% 热门组合（提高从30%）
             buyer = random.choice(self.hot_buyers)
             seller = random.choice(self.hot_sellers)
-        elif rand < 0.80:  # 50% 常规组合
+        elif rand < 0.80:  # 40% 常规组合（保持40%）
             buyer = random.choice(self.regular_buyers)
             seller = random.choice(self.regular_sellers)
-        else:  # 20% 长尾组合
+        else:  # 20% 长尾组合（保持20%）
             buyer = random.choice(self.all_buyers)
             seller = random.choice(self.all_sellers)
         return buyer, seller
@@ -260,19 +272,30 @@ class TestDataGenerator:
         statements = [stmt.strip() for stmt in indexes_sql.split(';') if stmt.strip()]
 
         for stmt in statements:
-            if stmt.startswith('CREATE INDEX'):
+            # 跳过注释行
+            if stmt.startswith('--') or not stmt.strip():
+                continue
+
+            if 'CREATE INDEX' in stmt.upper():
                 # 提取索引名（用于显示进度）
-                idx_name = stmt.split()[2] if len(stmt.split()) > 2 else 'unknown'
-                print(f"  创建索引 {idx_name}...")
-                start_time = time.time()
-                self.cur.execute(stmt)
-                self.conn.commit()
-                elapsed = time.time() - start_time
-                print(f"    ✓ 完成 (耗时: {elapsed:.2f}秒)")
+                try:
+                    idx_name = stmt.split()[2] if len(stmt.split()) > 2 else 'unknown'
+                    print(f"  创建索引 {idx_name}...")
+                    start_time = time.time()
+                    self.cur.execute(stmt)
+                    self.conn.commit()
+                    elapsed = time.time() - start_time
+                    print(f"    ✓ 完成 (耗时: {elapsed:.2f}秒)")
+                except Exception as e:
+                    print(f"    ❌ 创建失败: {e}")
             elif stmt.strip().upper().startswith('ANALYZE'):
                 print("  更新统计信息...")
-                self.cur.execute(stmt)
-                self.conn.commit()
+                try:
+                    self.cur.execute(stmt)
+                    self.conn.commit()
+                    print("    ✓ 统计信息更新完成")
+                except Exception as e:
+                    print(f"    ❌ 统计更新失败: {e}")
 
         print("✓ 索引创建完成")
     
@@ -351,7 +374,7 @@ class TestDataGenerator:
             for count_in_range, min_amt, max_amt in ranges:
                 for _ in range(count_in_range):
                     amount = random.uniform(min_amt, max_amt)
-                    tax_rate = np.random.choice(self.tax_rates, p=self.tax_weights)
+                    tax_rate = int(np.random.choice(self.tax_rates, p=self.tax_weights))
                     buyer_id, seller_id = self.generate_buyer_seller()
                     negative_data.append({
                         'id': id_counter,
@@ -367,7 +390,7 @@ class TestDataGenerator:
             total_count = count if count is not None else 1000
             for i in range(total_count):
                 amount = random.uniform(10, 5000)
-                tax_rate = np.random.choice(self.tax_rates, p=self.tax_weights)
+                tax_rate = int(np.random.choice(self.tax_rates, p=self.tax_weights))
                 buyer_id, seller_id = self.generate_buyer_seller()
                 negative_data.append({
                     'id': i + 1,
@@ -382,7 +405,7 @@ class TestDataGenerator:
             total_count = count if count is not None else 100
             for i in range(total_count):
                 amount = random.uniform(1, 10000)
-                tax_rate = np.random.choice(self.tax_rates, p=self.tax_weights)
+                tax_rate = int(np.random.choice(self.tax_rates, p=self.tax_weights))
                 buyer_id, seller_id = self.generate_buyer_seller()
                 negative_data.append({
                     'id': i + 1,

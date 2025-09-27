@@ -13,3 +13,6 @@ tqdm>=4.65.0
 
 # 类型提示支持（Python 3.7+）
 typing-extensions>=4.7.0
+
+# 系统监控
+psutil>=5.9.0
