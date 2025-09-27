@@ -100,13 +100,15 @@ class DatabaseManager:
 
     def get_candidates_batch(self,
                            conditions: List[tuple],
-                           limit: int = 10000) -> Dict[tuple, List[BlueLineItem]]:
+                           limit: int = 10000,
+                           group_counts: Dict[tuple, int] = None) -> Dict[tuple, List[BlueLineItem]]:
         """
         批量获取候选蓝票行，减少数据库往返次数
 
         Args:
             conditions: [(tax_rate, buyer_id, seller_id), ...] 条件列表
-            limit: 每个条件的限制数量
+            limit: 默认每个条件的限制数量
+            group_counts: {条件: 该组负数发票数量} 用于动态计算limit
 
         Returns:
             Dict[tuple, List[BlueLineItem]]: 条件到候选列表的映射
@@ -126,17 +128,34 @@ class DatabaseManager:
                 'limit': limit
             }):
                 with conn.cursor() as cur:
-                    # 构建批量查询的IN条件
-                    conditions_str = ','.join([f"({c[0]},{c[1]},{c[2]})" for c in conditions])
+                    # 使用UNION ALL + 动态LIMIT优化查询性能
+                    union_queries = []
 
-                    cur.execute(f"""
-                        SELECT line_id, remaining, tax_rate, buyer_id, seller_id
-                        FROM blue_lines
-                        WHERE (tax_rate, buyer_id, seller_id) IN ({conditions_str})
-                          AND remaining > 0
-                        ORDER BY tax_rate, buyer_id, seller_id, remaining ASC
-                    """)
+                    for condition in conditions:
+                        tax_rate, buyer_id, seller_id = condition
 
+                        # 动态计算该条件的limit
+                        if group_counts and condition in group_counts:
+                            # 每个负数发票100个候选，最多500个
+                            actual_limit = min(100 * group_counts[condition], 500)
+                        else:
+                            # 兼容模式：使用默认limit
+                            actual_limit = limit
+
+                        union_queries.append(f"""
+                            (SELECT line_id, remaining, tax_rate, buyer_id, seller_id
+                             FROM blue_lines
+                             WHERE tax_rate = {tax_rate}
+                               AND buyer_id = {buyer_id}
+                               AND seller_id = {seller_id}
+                               AND remaining > 0
+                             ORDER BY remaining ASC
+                             LIMIT {actual_limit})
+                        """)
+
+                    # 合并所有子查询
+                    query = " UNION ALL ".join(union_queries)
+                    cur.execute(query)
                     all_rows = cur.fetchall()
 
             with timer.measure("data_conversion", {

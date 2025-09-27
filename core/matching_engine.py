@@ -396,7 +396,26 @@ class GreedyMatchingEngine:
         if hasattr(candidate_provider, 'db_manager') and hasattr(candidate_provider.db_manager, 'get_candidates_batch'):
             logger.info(f"使用批量查询预取 {len(groups)} 组候选集")
             conditions = list(groups.keys())  # [(tax_rate, buyer_id, seller_id), ...]
-            group_candidates = candidate_provider.db_manager.get_candidates_batch(conditions)
+
+            # 计算每组的负数发票数量，用于动态limit
+            group_counts = {condition: len(group_negatives) for condition, group_negatives in groups.items()}
+
+            # 调试：打印统计信息
+            logger.info(f"条件总数: {len(conditions)}")
+            if conditions:
+                logger.info(f"前5个条件: {conditions[:5]}")
+                # 统计不同tax_rate, buyer_id, seller_id的数量
+                tax_rates = set(c[0] for c in conditions)
+                buyer_ids = set(c[1] for c in conditions)
+                seller_ids = set(c[2] for c in conditions)
+                logger.info(f"不同税率数: {len(tax_rates)}, 买方数: {len(buyer_ids)}, 卖方数: {len(seller_ids)}")
+
+                # 统计动态limit信息
+                total_limit = sum(min(100 * count, 500) for count in group_counts.values())
+                avg_limit = total_limit / len(group_counts) if group_counts else 0
+                logger.info(f"动态limit统计: 总计{total_limit}, 平均{avg_limit:.1f}, 最大{max(group_counts.values()) if group_counts else 0}个/组")
+
+            group_candidates = candidate_provider.db_manager.get_candidates_batch(conditions, group_counts=group_counts)
 
             # 确保所有组都有候选列表（即使为空）
             for group_key in groups.keys():

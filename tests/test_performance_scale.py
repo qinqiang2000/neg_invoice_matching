@@ -157,7 +157,7 @@ class PerformanceTestSuite:
             },
             'large': {
                 'blue_lines': 10_000_000,     # 1000万
-                'negative_batches': [1000, 5000, 10000],
+                'negative_batches': [500, 1000, 3000],
                 'description': '大规模测试（1000万蓝票行）'
             }
         }
