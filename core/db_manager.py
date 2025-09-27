@@ -1,4 +1,5 @@
 import psycopg2
+import psycopg2.extras
 from psycopg2.pool import SimpleConnectionPool
 from typing import List, Optional, Dict
 from decimal import Decimal
@@ -11,15 +12,22 @@ logger = logging.getLogger(__name__)
 class DatabaseManager:
     """数据库管理器，负责所有数据库操作"""
     
-    def __init__(self, db_config: dict, pool_size: int = 10):
+    def __init__(self, db_config: dict, pool_size: int = 20):
         """初始化数据库连接池"""
         self.pool = SimpleConnectionPool(
-            1, pool_size,
+            2, pool_size,  # 最小连接数从1增加到2
             host=db_config['host'],
             port=db_config['port'],
             database=db_config['database'],
             user=db_config['user'],
-            password=db_config['password']
+            password=db_config['password'],
+            # 连接池优化配置
+            connect_timeout=5,  # 连接超时5秒（降低延迟）
+            keepalives_idle=300,  # 空闲300秒后发送keepalive（减少）
+            keepalives_interval=10,  # keepalive间隔10秒（减少）
+            keepalives_count=3,  # 最多3次keepalive失败后断开
+            # 减少网络往返开销
+            application_name='neg_invoice_matching'
         )
     
     def get_candidates(self,
@@ -75,10 +83,95 @@ class DatabaseManager:
                 ]
         finally:
             with timer.measure("database_connection_release"):
-                self.pool.putconn(conn)
+                try:
+                    # 对于只读查询，不需要rollback，直接释放连接
+                    if conn and not conn.closed:
+                        self.pool.putconn(conn)
+                except Exception as e:
+                    logger.error(f"连接释放错误: {e}")
+                    # 如果连接有问题，强制关闭而不是放回池中
+                    try:
+                        if conn and not conn.closed:
+                            conn.close()
+                    except:
+                        pass
 
         return result
-    
+
+    def get_candidates_batch(self,
+                           conditions: List[tuple],
+                           limit: int = 10000) -> Dict[tuple, List[BlueLineItem]]:
+        """
+        批量获取候选蓝票行，减少数据库往返次数
+
+        Args:
+            conditions: [(tax_rate, buyer_id, seller_id), ...] 条件列表
+            limit: 每个条件的限制数量
+
+        Returns:
+            Dict[tuple, List[BlueLineItem]]: 条件到候选列表的映射
+        """
+        if not conditions:
+            return {}
+
+        timer = get_performance_timer()
+
+        with timer.measure("database_connection_acquire"):
+            conn = self.pool.getconn()
+
+        try:
+            with timer.measure("database_query_execution", {
+                'query_type': 'get_candidates_batch',
+                'conditions_count': len(conditions),
+                'limit': limit
+            }):
+                with conn.cursor() as cur:
+                    # 构建批量查询的IN条件
+                    conditions_str = ','.join([f"({c[0]},{c[1]},{c[2]})" for c in conditions])
+
+                    cur.execute(f"""
+                        SELECT line_id, remaining, tax_rate, buyer_id, seller_id
+                        FROM blue_lines
+                        WHERE (tax_rate, buyer_id, seller_id) IN ({conditions_str})
+                          AND remaining > 0
+                        ORDER BY tax_rate, buyer_id, seller_id, remaining ASC
+                    """)
+
+                    all_rows = cur.fetchall()
+
+            with timer.measure("data_conversion", {
+                'rows_count': len(all_rows)
+            }):
+                # 按条件分组结果
+                result = {condition: [] for condition in conditions}
+
+                for row in all_rows:
+                    condition = (row[2], row[3], row[4])  # tax_rate, buyer_id, seller_id
+                    if condition in result and len(result[condition]) < limit:
+                        result[condition].append(BlueLineItem(
+                            line_id=row[0],
+                            remaining=Decimal(str(row[1])),
+                            tax_rate=row[2],
+                            buyer_id=row[3],
+                            seller_id=row[4]
+                        ))
+
+        finally:
+            with timer.measure("database_connection_release"):
+                try:
+                    # 对于只读查询，不需要rollback，直接释放连接
+                    if conn and not conn.closed:
+                        self.pool.putconn(conn)
+                except Exception as e:
+                    logger.error(f"连接释放错误: {e}")
+                    try:
+                        if conn and not conn.closed:
+                            conn.close()
+                    except:
+                        pass
+
+        return result
+
     def save_match_results(self,
                           results: List[MatchResult],
                           batch_id: str) -> bool:
@@ -183,7 +276,16 @@ class DatabaseManager:
             return False
         finally:
             with timer.measure("database_connection_release"):
-                self.pool.putconn(conn)
+                try:
+                    if conn and not conn.closed:
+                        self.pool.putconn(conn)
+                except Exception as e:
+                    logger.error(f"连接释放错误: {e}")
+                    try:
+                        if conn and not conn.closed:
+                            conn.close()
+                    except:
+                        pass
     
     def get_statistics(self) -> Dict:
         """获取统计信息"""
@@ -218,6 +320,11 @@ class DatabaseManager:
                 
         finally:
             self.pool.putconn(conn)
+
+    def close(self):
+        """关闭数据库连接池"""
+        if self.pool:
+            self.pool.closeall()
 
 class CandidateProvider:
     """候选提供器，供匹配引擎使用"""

@@ -127,14 +127,34 @@ class TestDataGenerator:
     
     def setup_database(self):
         """设置数据库：创建表和索引"""
-        print("创建数据库表...")
+        print("创建数据库表和索引...")
 
-        # 从SQL文件加载建表语句
-        create_tables_sql = load_sql_file('schema/create_tables.sql')
+        # 优先使用合并的SQL文件（包含表和索引）
+        try:
+            combined_sql = load_sql_file('schema/create_tables_with_indexes.sql')
+            self.cur.execute(combined_sql)
+            self.conn.commit()
+            print("✓ 数据库表和索引创建完成（使用合并文件）")
+        except FileNotFoundError:
+            # 回退到分别创建表和索引
+            print("  使用分离文件创建表和索引...")
 
-        self.cur.execute(create_tables_sql)
-        self.conn.commit()
-        print("✓ 数据库表创建完成")
+            # 创建表
+            create_tables_sql = load_sql_file('schema/create_tables.sql')
+            self.cur.execute(create_tables_sql)
+            self.conn.commit()
+            print("  ✓ 数据库表创建完成")
+
+            # 自动创建索引
+            try:
+                self.create_indexes()
+                print("  ✓ 索引自动创建完成")
+            except Exception as e:
+                print(f"  ⚠️ 索引创建失败，请手动执行: python tests/test_data_generator.py --create-indexes")
+                print(f"     错误: {e}")
+        except Exception as e:
+            print(f"❌ 数据库设置失败: {e}")
+            raise
     
     def generate_blue_lines(self, total_lines: Optional[int] = None,
                            batch_id: Optional[str] = None,
@@ -608,10 +628,216 @@ class TestDataGenerator:
         statements = [stmt.strip() for stmt in reset_sql.split(';') if stmt.strip() and not stmt.strip().startswith('--')]
 
         for stmt in statements:
-            self.cur.execute(stmt)
+            if stmt.upper().startswith('SELECT'):
+                # 对于验证查询，显示结果
+                self.cur.execute(stmt)
+                result = self.cur.fetchone()
+                if result:
+                    total, restored, inconsistent, avg_remaining, avg_original = result
+                    print(f"  数据验证: 总行数={total:,}, 已恢复={restored:,}, 异常={inconsistent}, 平均余额={avg_remaining}, 平均原始={avg_original}")
+            else:
+                self.cur.execute(stmt)
 
         self.conn.commit()
         print("✓ 测试数据已重置")
+
+    def force_reset_to_fresh_state(self):
+        """强制重置所有数据到完全可用状态（用于性能测试）"""
+        print("强制重置数据到完全可用状态...")
+
+        # 从SQL文件加载强制重置语句
+        force_reset_sql = load_sql_file('test/force_reset_data.sql')
+
+        # 按分号分割并执行每个语句
+        statements = [stmt.strip() for stmt in force_reset_sql.split(';') if stmt.strip() and not stmt.strip().startswith('--')]
+
+        for stmt in statements:
+            if stmt.upper().startswith('SELECT'):
+                # 对于验证查询，显示结果
+                self.cur.execute(stmt)
+                result = self.cur.fetchone()
+                if result:
+                    total, available, exhausted, avg_remaining, avg_original, availability = result
+                    print(f"  数据验证: 总行数={total:,}, 完全可用={available:,}, 已用完={exhausted:,}")
+                    print(f"  平均余额={avg_remaining}, 平均原始={avg_original}, 可用性={availability}%")
+            else:
+                self.cur.execute(stmt)
+
+        self.conn.commit()
+        print("✓ 数据已强制重置到完全可用状态")
+
+    def create_data_snapshot(self, snapshot_name: str = None):
+        """创建数据快照（保存 remaining 值）"""
+        if snapshot_name is None:
+            snapshot_name = f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        print(f"创建数据快照: {snapshot_name}")
+
+        # 创建快照表（如果不存在）
+        self.cur.execute("""
+            CREATE TABLE IF NOT EXISTS data_snapshots (
+                snapshot_name VARCHAR(100),
+                line_id BIGINT,
+                remaining_value DECIMAL(15,2),
+                snapshot_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (snapshot_name, line_id)
+            )
+        """)
+
+        # 删除同名快照（如果存在）
+        self.cur.execute("DELETE FROM data_snapshots WHERE snapshot_name = %s", (snapshot_name,))
+
+        # 保存当前 remaining 值
+        self.cur.execute("""
+            INSERT INTO data_snapshots (snapshot_name, line_id, remaining_value)
+            SELECT %s, line_id, remaining FROM blue_lines
+        """, (snapshot_name,))
+
+        affected_rows = self.cur.rowcount
+        self.conn.commit()
+        print(f"✓ 快照已创建，保存了 {affected_rows:,} 条记录")
+        return snapshot_name
+
+    def restore_from_snapshot(self, snapshot_name: str):
+        """从快照恢复数据"""
+        print(f"从快照恢复数据: {snapshot_name}")
+
+        # 检查快照是否存在
+        self.cur.execute("SELECT COUNT(*) FROM data_snapshots WHERE snapshot_name = %s", (snapshot_name,))
+        snapshot_count = self.cur.fetchone()[0]
+
+        if snapshot_count == 0:
+            raise ValueError(f"快照不存在: {snapshot_name}")
+
+        # 清空匹配记录
+        self.cur.execute("TRUNCATE TABLE match_records CASCADE")
+
+        # 从快照恢复 remaining 值
+        self.cur.execute("""
+            UPDATE blue_lines
+            SET remaining = ds.remaining_value,
+                last_update = CURRENT_TIMESTAMP
+            FROM data_snapshots ds
+            WHERE blue_lines.line_id = ds.line_id
+              AND ds.snapshot_name = %s
+        """, (snapshot_name,))
+
+        updated_rows = self.cur.rowcount
+        self.conn.commit()
+        print(f"✓ 数据已恢复，更新了 {updated_rows:,} 条记录")
+
+        # 验证恢复状态
+        self._verify_data_consistency()
+
+    def list_snapshots(self):
+        """列出所有可用快照"""
+        self.cur.execute("""
+            SELECT snapshot_name, COUNT(*) as record_count,
+                   MIN(snapshot_time) as created_time
+            FROM data_snapshots
+            GROUP BY snapshot_name
+            ORDER BY created_time DESC
+        """)
+
+        results = self.cur.fetchall()
+        if not results:
+            print("暂无数据快照")
+            return
+
+        print("\n可用数据快照：")
+        print("=" * 60)
+        print(f"{'快照名称':<25} {'记录数':<10} {'创建时间'}")
+        print("-" * 60)
+
+        for snapshot_name, count, created_time in results:
+            print(f"{snapshot_name:<25} {count:<10,} {created_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    def delete_snapshot(self, snapshot_name: str):
+        """删除指定快照"""
+        self.cur.execute("DELETE FROM data_snapshots WHERE snapshot_name = %s", (snapshot_name,))
+        deleted_count = self.cur.rowcount
+        self.conn.commit()
+
+        if deleted_count > 0:
+            print(f"✓ 已删除快照 {snapshot_name}，清理了 {deleted_count:,} 条记录")
+        else:
+            print(f"快照 {snapshot_name} 不存在")
+
+    def _verify_data_consistency(self):
+        """验证数据一致性"""
+        self.cur.execute("""
+            SELECT
+                COUNT(*) as total_lines,
+                COUNT(CASE WHEN remaining < 0 THEN 1 END) as negative_remaining,
+                COUNT(CASE WHEN remaining > original_amount THEN 1 END) as excess_remaining,
+                ROUND(AVG(remaining), 2) as avg_remaining,
+                ROUND(SUM(remaining), 2) as total_remaining
+            FROM blue_lines
+        """)
+
+        result = self.cur.fetchone()
+        if result:
+            total, negative, excess, avg_remaining, total_remaining = result
+            print(f"  数据验证: 总行数={total:,}, 负数余额={negative}, 超额余额={excess}")
+            print(f"  平均余额={avg_remaining}, 总余额={total_remaining:,}")
+
+            if negative > 0 or excess > 0:
+                print(f"  ⚠️  发现数据异常: 负数余额={negative}, 超额余额={excess}")
+
+    def get_data_utilization_stats(self):
+        """获取数据利用率统计"""
+        self.cur.execute("""
+            SELECT
+                COUNT(*) as total_lines,
+                COUNT(CASE WHEN remaining = 0 THEN 1 END) as exhausted_lines,
+                COUNT(CASE WHEN remaining = original_amount THEN 1 END) as unused_lines,
+                COUNT(CASE WHEN remaining > 0 AND remaining < original_amount THEN 1 END) as partial_used_lines,
+                ROUND(AVG(remaining / original_amount * 100), 2) as avg_utilization_percent,
+                ROUND(SUM(remaining), 2) as total_remaining,
+                ROUND(SUM(original_amount), 2) as total_original
+            FROM blue_lines
+            WHERE original_amount > 0
+        """)
+
+        result = self.cur.fetchone()
+        if result:
+            total, exhausted, unused, partial, avg_util, total_remaining, total_original = result
+
+            # 处理 None 值
+            total = total or 0
+            exhausted = exhausted or 0
+            unused = unused or 0
+            partial = partial or 0
+            avg_util = avg_util or 0
+            total_remaining = total_remaining or 0
+            total_original = total_original or 0
+
+            utilization_rate = (1 - total_remaining / total_original) * 100 if total_original > 0 else 0
+
+            print(f"\n📊 数据利用率统计:")
+            print(f"  总行数: {total:,}")
+            if total > 0:
+                print(f"  已用完: {exhausted:,} ({exhausted/total*100:.1f}%)")
+                print(f"  未使用: {unused:,} ({unused/total*100:.1f}%)")
+                print(f"  部分使用: {partial:,} ({partial/total*100:.1f}%)")
+            else:
+                print(f"  已用完: {exhausted:,} (0.0%)")
+                print(f"  未使用: {unused:,} (0.0%)")
+                print(f"  部分使用: {partial:,} (0.0%)")
+            print(f"  平均利用率: {avg_util:.1f}%")
+            print(f"  总体利用率: {utilization_rate:.1f}%")
+            print(f"  剩余金额: {total_remaining:,} / {total_original:,}")
+
+            return {
+                'total_lines': total,
+                'exhausted_lines': exhausted,
+                'unused_lines': unused,
+                'partial_used_lines': partial,
+                'avg_utilization_percent': avg_util,
+                'total_utilization_percent': utilization_rate,
+                'total_remaining': total_remaining,
+                'total_original': total_original
+            }
     
     def close(self):
         """关闭数据库连接"""
@@ -666,6 +892,28 @@ def run_generator(args):
             print(f"\n=== 清理批次 {args.clear_batch} ===")
             generator.clear_batch(args.clear_batch)
 
+        # 数据快照管理操作
+        if args.create_snapshot:
+            print(f"\n=== 创建数据快照 ===")
+            snapshot_name = generator.create_data_snapshot(args.snapshot_name)
+            print(f"快照创建完成: {snapshot_name}")
+
+        if args.list_snapshots:
+            print("\n=== 快照列表 ===")
+            generator.list_snapshots()
+
+        if args.restore_snapshot:
+            print(f"\n=== 恢复快照 {args.restore_snapshot} ===")
+            generator.restore_from_snapshot(args.restore_snapshot)
+
+        if args.delete_snapshot:
+            print(f"\n=== 删除快照 {args.delete_snapshot} ===")
+            generator.delete_snapshot(args.delete_snapshot)
+
+        if args.data_stats:
+            print("\n=== 数据利用率统计 ===")
+            generator.get_data_utilization_stats()
+
         # 3. 创建索引（如果需要）
         if args.create_indexes:
             print("\n=== 创建索引 ===")
@@ -690,6 +938,10 @@ def run_generator(args):
         if args.reset_data:
             print("\n=== 重置测试数据 ===")
             generator.reset_test_data()
+
+        if args.force_reset:
+            print("\n=== 强制重置到完全可用状态 ===")
+            generator.force_reset_to_fresh_state()
 
         print("\n✓ 操作完成")
 
@@ -764,6 +1016,8 @@ def parse_args():
                        help='生成负数发票测试数据')
     parser.add_argument('--reset-data', action='store_true',
                        help='重置测试数据')
+    parser.add_argument('--force-reset', action='store_true',
+                       help='强制重置数据到完全可用状态（用于性能测试）')
 
     # 数据生成参数
     parser.add_argument('--total-lines', type=int,
@@ -789,6 +1043,20 @@ def parse_args():
     parser.add_argument('--clear-batch', type=str,
                        help='清理指定批次的数据')
 
+    # 数据快照管理参数
+    parser.add_argument('--create-snapshot', action='store_true',
+                       help='创建数据快照（保存当前 remaining 值）')
+    parser.add_argument('--snapshot-name', type=str,
+                       help='快照名称（可选，默认生成时间戳）')
+    parser.add_argument('--list-snapshots', action='store_true',
+                       help='列出所有可用快照')
+    parser.add_argument('--restore-snapshot', type=str,
+                       help='从指定快照恢复数据')
+    parser.add_argument('--delete-snapshot', type=str,
+                       help='删除指定快照')
+    parser.add_argument('--data-stats', action='store_true',
+                       help='显示数据利用率统计')
+
     args = parser.parse_args()
 
     # 如果使用 --all，则启用所有操作
@@ -799,14 +1067,17 @@ def parse_args():
         args.generate_negatives = True
         args.show_samples = True
 
-    # 如果没有指定任何操作，默认执行所有操作
+    # 如果没有指定任何操作，默认只生成数据（不删除表）
     if not any([
         args.setup_db, args.generate_blue_lines, args.create_indexes,
-        args.generate_negatives, args.reset_data, args.list_batches, args.clear_batch
+        args.generate_negatives, args.reset_data, args.force_reset, args.list_batches, args.clear_batch,
+        args.create_snapshot, args.list_snapshots, args.restore_snapshot,
+        args.delete_snapshot, args.data_stats
     ]):
-        args.setup_db = True
+        # 只生成数据，不执行破坏性操作
         args.generate_blue_lines = True
-        args.create_indexes = True
+        args.create_indexes = True  # 确保索引存在
+        # 注意：不自动设置 setup_db = True，避免意外删除表
         args.generate_negatives = True
         args.show_samples = True
 

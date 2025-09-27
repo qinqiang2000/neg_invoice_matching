@@ -1,11 +1,23 @@
 from typing import List, Dict, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 import logging
 import time
 import copy
 
 logger = logging.getLogger(__name__)
+
+# 失败原因常量
+class FailureReasons:
+    NO_CANDIDATES = "no_candidates"
+    NO_MATCHING_TAX_RATE = "no_matching_tax_rate"
+    NO_MATCHING_BUYER = "no_matching_buyer"
+    NO_MATCHING_SELLER = "no_matching_seller"
+    INSUFFICIENT_TOTAL_AMOUNT = "insufficient_total_amount"
+    FRAGMENTATION_ISSUE = "fragmentation_issue"
+    GREEDY_SUBOPTIMAL = "greedy_suboptimal"
+    CONCURRENT_CONFLICT = "concurrent_conflict"
+    AMOUNT_TOO_SMALL = "amount_too_small"
 
 @dataclass
 class BlueLineItem:
@@ -34,6 +46,23 @@ class MatchAllocation:
     remaining_after: Decimal
 
 @dataclass
+class MatchAttempt:
+    """匹配尝试记录"""
+    step: str                           # 步骤名称
+    blue_line_id: Optional[int]         # 尝试的蓝票行ID
+    amount_attempted: Optional[Decimal] # 尝试分配的金额
+    success: bool                       # 是否成功
+    reason: Optional[str] = None        # 失败原因
+
+@dataclass
+class MatchFailureDetail:
+    """匹配失败详情"""
+    reason_code: str                    # 失败代码
+    reason_description: str             # 人类可读描述
+    diagnostic_data: Dict               # 诊断数据
+    suggested_actions: List[str]        # 建议操作
+
+@dataclass
 class MatchResult:
     """匹配结果"""
     negative_invoice_id: int
@@ -42,6 +71,8 @@ class MatchResult:
     total_matched: Decimal
     fragments_created: int
     failure_reason: Optional[str] = None
+    failure_detail: Optional[MatchFailureDetail] = None
+    match_attempts: List[MatchAttempt] = field(default_factory=list)
 
 class GreedyMatchingEngine:
     """
@@ -58,33 +89,70 @@ class GreedyMatchingEngine:
         """
         self.fragment_threshold = fragment_threshold
         
-    def match_single(self, 
+    def match_single(self,
                     negative: NegativeInvoice,
                     candidates: List[BlueLineItem]) -> MatchResult:
         """
-        匹配单个负数发票
-        
+        匹配单个负数发票（增强版，包含详细失败追踪）
+
         Args:
             negative: 负数发票
             candidates: 候选蓝票行列表（应已排序）
-            
+
         Returns:
-            MatchResult: 匹配结果
+            MatchResult: 匹配结果（包含详细失败信息）
         """
+        match_attempts = []
+
+        # 记录候选集查找尝试
+        match_attempts.append(MatchAttempt(
+            step="candidate_search",
+            blue_line_id=None,
+            amount_attempted=None,
+            success=len(candidates) > 0,
+            reason=f"找到{len(candidates)}个候选蓝票行"
+        ))
+
         if not candidates:
+            failure_detail = self._create_failure_detail(
+                reason_code=FailureReasons.NO_CANDIDATES,
+                negative=negative,
+                candidates=candidates,
+                diagnostic_data={
+                    "candidate_count": 0,
+                    "search_conditions": {
+                        "tax_rate": negative.tax_rate,
+                        "buyer_id": negative.buyer_id,
+                        "seller_id": negative.seller_id
+                    }
+                }
+            )
+
             return MatchResult(
                 negative_invoice_id=negative.invoice_id,
                 success=False,
                 allocations=[],
                 total_matched=Decimal('0'),
                 fragments_created=0,
-                failure_reason="no_candidates"
+                failure_reason=FailureReasons.NO_CANDIDATES,
+                failure_detail=failure_detail,
+                match_attempts=match_attempts
             )
-        
+
+        # 分析候选集
+        total_available = sum(c.remaining for c in candidates)
+        match_attempts.append(MatchAttempt(
+            step="candidate_analysis",
+            blue_line_id=None,
+            amount_attempted=None,
+            success=total_available >= negative.amount,
+            reason=f"候选集总额{total_available}，需求{negative.amount}"
+        ))
+
         need = negative.amount
         allocations = []
         fragments_created = 0
-        
+
         # 贪婪分配：从小到大使用
         for blue_line in candidates:
             if need <= Decimal('0.01'):  # 允许1分钱误差
@@ -93,6 +161,15 @@ class GreedyMatchingEngine:
             # 计算使用量
             use_amount = min(need, blue_line.remaining)
             remaining_after = blue_line.remaining - use_amount
+
+            # 记录分配尝试
+            match_attempts.append(MatchAttempt(
+                step="allocation",
+                blue_line_id=blue_line.line_id,
+                amount_attempted=use_amount,
+                success=True,
+                reason=f"从蓝票行{blue_line.line_id}分配{use_amount}"
+            ))
 
             allocations.append(MatchAllocation(
                 blue_line_id=blue_line.line_id,
@@ -108,19 +185,106 @@ class GreedyMatchingEngine:
 
             # 调试输出
             logger.debug(f"使用蓝票行 {blue_line.line_id}: 使用 {use_amount}, 剩余需求 {need}")
-        
+
         # 判断是否成功
         total_matched = negative.amount - need
         success = need <= Decimal('0.01')
-        
+
+        if not success:
+            # 创建详细失败信息
+            failure_detail = self._create_failure_detail(
+                reason_code=FailureReasons.INSUFFICIENT_TOTAL_AMOUNT,
+                negative=negative,
+                candidates=candidates,
+                diagnostic_data={
+                    "needed_amount": float(negative.amount),
+                    "total_available": float(total_available),
+                    "shortage": float(need),
+                    "shortage_percentage": float(need / negative.amount * 100),
+                    "candidate_count": len(candidates),
+                    "largest_single_amount": float(max(c.remaining for c in candidates)),
+                    "fragmentation_score": len([c for c in candidates if c.remaining < self.fragment_threshold]) / len(candidates)
+                }
+            )
+
+            return MatchResult(
+                negative_invoice_id=negative.invoice_id,
+                success=False,
+                allocations=[],
+                total_matched=Decimal('0'),
+                fragments_created=0,
+                failure_reason=FailureReasons.INSUFFICIENT_TOTAL_AMOUNT,
+                failure_detail=failure_detail,
+                match_attempts=match_attempts
+            )
+
         return MatchResult(
             negative_invoice_id=negative.invoice_id,
             success=success,
-            allocations=allocations if success else [],
-            total_matched=total_matched if success else Decimal('0'),
-            fragments_created=fragments_created if success else 0,
-            failure_reason=None if success else "insufficient_funds"
+            allocations=allocations,
+            total_matched=total_matched,
+            fragments_created=fragments_created,
+            failure_reason=None,
+            failure_detail=None,
+            match_attempts=match_attempts
         )
+
+    def _create_failure_detail(self, reason_code: str, negative: NegativeInvoice,
+                              candidates: List[BlueLineItem], diagnostic_data: Dict) -> MatchFailureDetail:
+        """创建详细失败信息"""
+
+        reason_descriptions = {
+            FailureReasons.NO_CANDIDATES: "未找到符合条件的蓝票行",
+            FailureReasons.INSUFFICIENT_TOTAL_AMOUNT: "候选集总额不足以满足需求",
+            FailureReasons.FRAGMENTATION_ISSUE: "候选集过于碎片化，无法有效组合",
+            FailureReasons.NO_MATCHING_TAX_RATE: "税率不匹配",
+            FailureReasons.NO_MATCHING_BUYER: "买方不匹配",
+            FailureReasons.NO_MATCHING_SELLER: "卖方不匹配"
+        }
+
+        # 生成建议操作
+        suggested_actions = self._generate_suggestions(reason_code, negative, candidates, diagnostic_data)
+
+        return MatchFailureDetail(
+            reason_code=reason_code,
+            reason_description=reason_descriptions.get(reason_code, "未知失败原因"),
+            diagnostic_data=diagnostic_data,
+            suggested_actions=suggested_actions
+        )
+
+    def _generate_suggestions(self, reason_code: str, negative: NegativeInvoice,
+                            candidates: List[BlueLineItem], diagnostic_data: Dict) -> List[str]:
+        """基于失败原因生成建议操作"""
+
+        suggestions = []
+
+        if reason_code == FailureReasons.NO_CANDIDATES:
+            suggestions.extend([
+                "检查税率、买卖方条件是否过于严格",
+                "确认是否有符合条件的蓝票行已入库",
+                "考虑放宽匹配条件或等待新的蓝票入库"
+            ])
+
+        elif reason_code == FailureReasons.INSUFFICIENT_TOTAL_AMOUNT:
+            shortage_pct = diagnostic_data.get('shortage_percentage', 0)
+            if shortage_pct > 50:
+                suggestions.extend([
+                    "候选集严重不足，建议等待更多蓝票入库",
+                    "考虑将负数发票拆分为多张小额发票分批处理"
+                ])
+            else:
+                suggestions.extend([
+                    "差额较小，可等待新的蓝票入库后重试",
+                    "检查是否有其他相似条件的蓝票可用"
+                ])
+
+            if diagnostic_data.get('fragmentation_score', 0) > 0.7:
+                suggestions.append("候选集过于碎片化，建议优化数据清理策略")
+
+        if not suggestions:
+            suggestions.append("请联系技术支持进行详细分析")
+
+        return suggestions
     
     def _match_batch_standard(self,
                              negatives: List[NegativeInvoice],
@@ -226,8 +390,25 @@ class GreedyMatchingEngine:
                                       groups: Dict[tuple, List[tuple]],
                                       candidate_provider) -> Dict[tuple, List[BlueLineItem]]:
         """
-        为所有组预取候选集
+        为所有组预取候选集（优化版：使用批量查询）
         """
+        # 优先使用批量查询（如果候选提供器支持）
+        if hasattr(candidate_provider, 'db_manager') and hasattr(candidate_provider.db_manager, 'get_candidates_batch'):
+            logger.info(f"使用批量查询预取 {len(groups)} 组候选集")
+            conditions = list(groups.keys())  # [(tax_rate, buyer_id, seller_id), ...]
+            group_candidates = candidate_provider.db_manager.get_candidates_batch(conditions)
+
+            # 确保所有组都有候选列表（即使为空）
+            for group_key in groups.keys():
+                if group_key not in group_candidates:
+                    group_candidates[group_key] = []
+                else:
+                    logger.debug(f"组 {group_key} 获取到 {len(group_candidates[group_key])} 个候选")
+
+            return group_candidates
+
+        # 回退到单次查询
+        logger.warning("候选提供器不支持批量查询，回退到单次查询模式")
         group_candidates = {}
 
         for group_key in groups.keys():
