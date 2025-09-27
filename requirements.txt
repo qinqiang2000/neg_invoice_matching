@@ -1,0 +1,15 @@
+# 数据库连接
+psycopg2-binary>=2.9.7
+
+# 数据处理和科学计算
+numpy>=1.24.0
+pandas>=2.0.0
+
+# 数据可视化
+matplotlib>=3.7.0
+
+# 进度条显示
+tqdm>=4.65.0
+
+# 类型提示支持（Python 3.7+）
+typing-extensions>=4.7.0
