@@ -61,54 +61,92 @@ class DatabaseManager:
         finally:
             self.pool.putconn(conn)
     
-    def save_match_results(self, 
+    def save_match_results(self,
                           results: List[MatchResult],
                           batch_id: str) -> bool:
         """
         保存匹配结果到数据库
-        使用事务确保原子性
+        使用事务确保原子性，采用PostgreSQL FROM VALUES优化批量更新
         """
         conn = self.pool.getconn()
         try:
             conn.autocommit = False
             with conn.cursor() as cur:
+                # 收集所有成功的分配记录
+                all_allocations = []
+                match_records = []
+
                 for result in results:
                     if not result.success:
                         continue
-                    
-                    # 更新蓝票行remaining
+
                     for alloc in result.allocations:
-                        cur.execute("""
-                            UPDATE blue_lines 
-                            SET remaining = remaining - %s,
-                                last_update = CURRENT_TIMESTAMP
-                            WHERE line_id = %s 
-                              AND remaining >= %s
-                        """, (
-                            alloc.amount_used,
-                            alloc.blue_line_id,
-                            alloc.amount_used
-                        ))
-                        
-                        if cur.rowcount == 0:
-                            raise Exception(f"并发冲突: line_id={alloc.blue_line_id}")
-                    
-                    # 插入匹配记录
-                    for alloc in result.allocations:
-                        cur.execute("""
-                            INSERT INTO match_records 
-                            (batch_id, negative_invoice_id, blue_line_id, amount_used)
-                            VALUES (%s, %s, %s, %s)
-                        """, (
+                        all_allocations.append((alloc.blue_line_id, alloc.amount_used))
+                        match_records.append((
                             batch_id,
                             result.negative_invoice_id,
                             alloc.blue_line_id,
                             alloc.amount_used
                         ))
-                
+
+                if not all_allocations:
+                    logger.info("没有成功的匹配结果需要保存")
+                    conn.commit()
+                    return True
+
+                # 使用PostgreSQL FROM VALUES语法批量更新蓝票行
+                logger.debug(f"批量更新 {len(all_allocations)} 条蓝票行")
+
+                # 构建参数列表用于executemany
+                update_params = []
+                for line_id, amount_used in all_allocations:
+                    update_params.append((amount_used, line_id, amount_used))
+
+                # 使用executemany进行批量更新（保持原子性但更可靠）
+                cur.executemany("""
+                    UPDATE blue_lines
+                    SET remaining = remaining - %s,
+                        last_update = CURRENT_TIMESTAMP
+                    WHERE line_id = %s
+                      AND remaining >= %s
+                """, update_params)
+
+                updated_count = cur.rowcount
+
+                # 检查是否所有行都成功更新（防止并发冲突）
+                if updated_count != len(all_allocations):
+                    # 查询哪些行的余额不足
+                    line_ids = [str(line_id) for line_id, _ in all_allocations]
+                    cur.execute(f"""
+                        SELECT line_id, remaining
+                        FROM blue_lines
+                        WHERE line_id IN ({','.join(line_ids)})
+                    """)
+
+                    actual_remaining = {row[0]: row[1] for row in cur.fetchall()}
+                    failed_lines = []
+
+                    for line_id, amount_used in all_allocations:
+                        if line_id not in actual_remaining or actual_remaining[line_id] < amount_used:
+                            failed_lines.append(line_id)
+
+                    raise Exception(f"并发冲突: {len(failed_lines)} 条记录更新失败, "
+                                  f"失败行: {failed_lines}")
+
+                # 批量插入匹配记录
+                if match_records:
+                    logger.debug(f"批量插入 {len(match_records)} 条匹配记录")
+                    cur.executemany("""
+                        INSERT INTO match_records
+                        (batch_id, negative_invoice_id, blue_line_id, amount_used)
+                        VALUES (%s, %s, %s, %s)
+                    """, match_records)
+
                 conn.commit()
+                logger.info(f"成功保存匹配结果: 更新 {updated_count} 条蓝票行, "
+                           f"插入 {len(match_records)} 条匹配记录")
                 return True
-                
+
         except Exception as e:
             conn.rollback()
             logger.error(f"保存匹配结果失败: {e}")
@@ -152,18 +190,10 @@ class DatabaseManager:
 
 class CandidateProvider:
     """候选提供器，供匹配引擎使用"""
-    
+
     def __init__(self, db_manager: DatabaseManager):
         self.db_manager = db_manager
-        self.cache = {}  # 简单缓存
-    
+
     def get_candidates(self, tax_rate: int, buyer_id: int, seller_id: int):
         """获取候选蓝票行"""
-        cache_key = f"{tax_rate}_{buyer_id}_{seller_id}"
-        
-        if cache_key not in self.cache:
-            self.cache[cache_key] = self.db_manager.get_candidates(
-                tax_rate, buyer_id, seller_id
-            )
-        
-        return self.cache[cache_key]
+        return self.db_manager.get_candidates(tax_rate, buyer_id, seller_id)

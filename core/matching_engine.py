@@ -2,6 +2,8 @@ from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 from decimal import Decimal
 import logging
+import time
+import copy
 
 logger = logging.getLogger(__name__)
 
@@ -120,13 +122,15 @@ class GreedyMatchingEngine:
             failure_reason=None if success else "insufficient_funds"
         )
     
-    def match_batch(self,
-                   negatives: List[NegativeInvoice],
-                   candidate_provider,
-                   sort_strategy: str = "amount_desc") -> List[MatchResult]:
+    def _match_batch_standard(self,
+                             negatives: List[NegativeInvoice],
+                             candidate_provider,
+                             sort_strategy: str = "amount_desc",
+                             enable_monitoring: bool = True) -> List[MatchResult]:
         """
         批量匹配负数发票
-        
+        采用分组策略减少数据库查询次数
+
         Args:
             negatives: 负数发票列表
             candidate_provider: 提供候选蓝票行的函数/对象
@@ -134,47 +138,146 @@ class GreedyMatchingEngine:
                 - amount_desc: 金额降序（大额优先）
                 - amount_asc: 金额升序（小额优先）
                 - priority: 按优先级
-                
+            enable_monitoring: 是否启用监控
+
         Returns:
             List[MatchResult]: 匹配结果列表
         """
-        # 排序负数发票，但保持原始索引用于结果排序
-        indexed_negatives = [(i, neg) for i, neg in enumerate(negatives)]
-        sorted_indexed = sorted(indexed_negatives,
-                               key=lambda x: self._get_sort_key(x[1], sort_strategy))
+        start_time = time.time()
+
+        # 第一步：按(tax_rate, buyer_id, seller_id)分组负数发票
+        groups = self._group_negatives_by_conditions(negatives)
+        logger.info(f"将 {len(negatives)} 个负数发票分为 {len(groups)} 组")
 
         # 初始化结果列表，保持原始顺序
         results = [None] * len(negatives)
-        used_blue_lines = set()  # 记录已使用的蓝票行
 
-        for original_index, negative in sorted_indexed:
-            # 获取候选（过滤已使用的）
-            all_candidates = candidate_provider.get_candidates(
-                negative.tax_rate,
-                negative.buyer_id, 
-                negative.seller_id
-            )
-            
-            # 过滤已完全使用的蓝票行
+        # 第二步：预取所有组的候选集（批量查询优化）
+        group_candidates = self._prefetch_candidates_for_groups(groups, candidate_provider)
+
+        # 第三步：按组处理负数发票
+        for group_key, group_negatives in groups.items():
+            logger.debug(f"处理组 {group_key}: {len(group_negatives)} 个负数发票")
+
+            # 获取该组的候选集
+            candidates = group_candidates[group_key]
+            if not candidates:
+                logger.warning(f"组 {group_key} 没有可用候选")
+                # 标记该组所有发票为失败
+                for original_index, negative in group_negatives:
+                    results[original_index] = MatchResult(
+                        negative_invoice_id=negative.invoice_id,
+                        success=False,
+                        allocations=[],
+                        total_matched=Decimal('0'),
+                        fragments_created=0,
+                        failure_reason="no_candidates"
+                    )
+                continue
+
+            # 组内排序并匹配
+            group_results = self._match_group(group_negatives, candidates, sort_strategy)
+
+            # 将结果放回原始位置
+            for (original_index, _), result in zip(group_negatives, group_results):
+                results[original_index] = result
+
+        # 计算总执行时间
+        execution_time = time.time() - start_time
+
+        # 记录监控数据
+        if enable_monitoring:
+            try:
+                from .monitoring import get_monitor
+                monitor = get_monitor()
+                monitor.record_batch_execution(
+                    execution_time=execution_time,
+                    results=results,
+                    negatives_count=len(negatives),
+                    groups_count=len(groups)
+                )
+
+
+            except ImportError:
+                logger.debug("监控模块未导入，跳过监控记录")
+            except Exception as e:
+                logger.warning(f"记录监控数据失败: {e}")
+
+        return results
+
+    def _group_negatives_by_conditions(self,
+                                     negatives: List[NegativeInvoice]) -> Dict[tuple, List[tuple]]:
+        """
+        按(tax_rate, buyer_id, seller_id)分组负数发票
+
+        Returns:
+            Dict[tuple, List[tuple]]: 分组结果，key为条件元组，value为(原始索引, 负数发票)列表
+        """
+        groups = {}
+        for i, negative in enumerate(negatives):
+            group_key = (negative.tax_rate, negative.buyer_id, negative.seller_id)
+            if group_key not in groups:
+                groups[group_key] = []
+            groups[group_key].append((i, negative))
+
+        return groups
+
+    def _prefetch_candidates_for_groups(self,
+                                      groups: Dict[tuple, List[tuple]],
+                                      candidate_provider) -> Dict[tuple, List[BlueLineItem]]:
+        """
+        为所有组预取候选集
+        """
+        group_candidates = {}
+
+        for group_key in groups.keys():
+            tax_rate, buyer_id, seller_id = group_key
+            candidates = candidate_provider.get_candidates(tax_rate, buyer_id, seller_id)
+            group_candidates[group_key] = candidates
+            logger.debug(f"组 {group_key} 获取到 {len(candidates)} 个候选")
+
+        return group_candidates
+
+    def _match_group(self,
+                    group_negatives: List[tuple],
+                    candidates: List[BlueLineItem],
+                    sort_strategy: str) -> List[MatchResult]:
+        """
+        匹配单个组内的负数发票
+        需要实时更新候选集的remaining值，避免重复分配
+        """
+        # 组内排序
+        sorted_group = sorted(group_negatives,
+                            key=lambda x: self._get_sort_key(x[1], sort_strategy))
+
+        results = []
+        # 创建候选集的深拷贝以实时更新remaining
+        local_candidates = {c.line_id: copy.deepcopy(c) for c in candidates}
+
+        for original_index, negative in sorted_group:
+            # 过滤remaining为0的蓝票行，并转换为列表
             available_candidates = [
-                c for c in all_candidates 
-                if c.line_id not in used_blue_lines
+                c for c in local_candidates.values()
+                if c.remaining > Decimal('0.01')
             ]
-            
+
+            # 按remaining升序排序（贪婪算法要求）
+            available_candidates.sort(key=lambda x: x.remaining)
+
             # 执行匹配
             result = self.match_single(negative, available_candidates)
-            results[original_index] = result
-            
-            # 记录已使用的蓝票行
+            results.append(result)
+
+            # 实时更新本地候选集的remaining值
             if result.success:
                 for alloc in result.allocations:
-                    if alloc.remaining_after <= Decimal('0.01'):
-                        used_blue_lines.add(alloc.blue_line_id)
-            
-            logger.info(f"匹配负数发票 {negative.invoice_id}: "
+                    if alloc.blue_line_id in local_candidates:
+                        local_candidates[alloc.blue_line_id].remaining = alloc.remaining_after
+
+            logger.debug(f"匹配负数发票 {negative.invoice_id}: "
                        f"{'成功' if result.success else '失败'}, "
                        f"金额: {negative.amount}")
-        
+
         return results
     
     def _get_sort_key(self, negative: NegativeInvoice, strategy: str):
@@ -201,11 +304,164 @@ class GreedyMatchingEngine:
         else:
             return negatives
     
+    def match_batch_streaming(self,
+                             negatives: List[NegativeInvoice],
+                             candidate_provider,
+                             batch_size: int = 1000,
+                             sort_strategy: str = "amount_desc",
+                             enable_monitoring: bool = True) -> List[MatchResult]:
+        """
+        流式批量匹配负数发票
+        适用于大批量数据，减少内存使用
+
+        Args:
+            negatives: 负数发票列表
+            candidate_provider: 提供候选蓝票行的函数/对象
+            batch_size: 每批处理的负数发票数量
+            sort_strategy: 排序策略
+            enable_monitoring: 是否启用监控
+
+        Returns:
+            List[MatchResult]: 匹配结果列表
+        """
+        total_count = len(negatives)
+        logger.info(f"流式处理 {total_count} 个负数发票，批次大小: {batch_size}")
+
+        all_results = []
+        start_time = time.time()
+
+        # 分批处理
+        for i in range(0, total_count, batch_size):
+            batch_end = min(i + batch_size, total_count)
+            batch_negatives = negatives[i:batch_end]
+
+            logger.debug(f"处理批次 {i//batch_size + 1}/{(total_count-1)//batch_size + 1}: "
+                        f"发票 {i+1}-{batch_end}")
+
+            # 处理当前批次（禁用子批次监控，最后统一记录）
+            batch_results = self._match_batch_standard(
+                batch_negatives,
+                candidate_provider,
+                sort_strategy,
+                enable_monitoring=False
+            )
+
+            all_results.extend(batch_results)
+
+
+            logger.debug(f"批次完成，当前总进度: {len(all_results)}/{total_count}")
+
+        # 计算总执行时间
+        total_execution_time = time.time() - start_time
+
+        # 记录监控数据（整体统计）
+        if enable_monitoring:
+            try:
+                from .monitoring import get_monitor
+                monitor = get_monitor()
+
+                # 计算分组数量（估算）
+                groups = self._group_negatives_by_conditions(negatives)
+                groups_count = len(groups)
+
+                monitor.record_batch_execution(
+                    execution_time=total_execution_time,
+                    results=all_results,
+                    negatives_count=total_count,
+                    groups_count=groups_count
+                )
+
+
+            except ImportError:
+                logger.debug("监控模块未导入，跳过监控记录")
+            except Exception as e:
+                logger.warning(f"记录监控数据失败: {e}")
+
+        logger.info(f"流式处理完成: {total_count} 个负数发票，总耗时 {total_execution_time:.3f}s")
+        return all_results
+
+    def match_batch(self,
+                   negatives: List[NegativeInvoice],
+                   candidate_provider,
+                   sort_strategy: str = "amount_desc",
+                   enable_monitoring: bool = True) -> List[MatchResult]:
+        """
+        批量匹配负数发票
+        自动根据数据量选择最优处理方式
+
+        Args:
+            negatives: 负数发票列表
+            candidate_provider: 提供候选蓝票行的函数/对象
+            sort_strategy: 排序策略
+            enable_monitoring: 是否启用监控
+
+        Returns:
+            List[MatchResult]: 匹配结果列表
+        """
+        batch_count = len(negatives)
+
+        # 智能路由：自动选择最优处理方式
+        if batch_count >= 10000:
+            # 大批量：使用流式处理
+            logger.debug(f"大批量数据 ({batch_count} 条)，自动启用流式处理")
+            return self.match_batch_streaming(
+                negatives=negatives,
+                candidate_provider=candidate_provider,
+                batch_size=1000,
+                sort_strategy=sort_strategy,
+                enable_monitoring=enable_monitoring
+            )
+        else:
+            # 小中批量：使用标准处理
+            logger.debug(f"标准批量数据 ({batch_count} 条)，使用常规处理")
+            return self._match_batch_standard(
+                negatives=negatives,
+                candidate_provider=candidate_provider,
+                sort_strategy=sort_strategy,
+                enable_monitoring=enable_monitoring
+            )
+
+    def get_processing_recommendation(self, batch_size: int) -> Dict:
+        """
+        获取处理方式建议
+
+        Args:
+            batch_size: 批次大小
+
+        Returns:
+            Dict: 包含建议信息的字典
+        """
+        if batch_size < 1000:
+            return {
+                'recommended_method': 'match_batch',
+                'reason': '小批量数据，标准处理即可',
+                'expected_memory': f'~{batch_size * 0.1:.1f}MB',
+                'processing_time': '快速',
+                'stability': '优秀'
+            }
+        elif batch_size < 10000:
+            return {
+                'recommended_method': 'match_batch',
+                'reason': '中等批量数据，标准处理最优',
+                'expected_memory': f'~{batch_size * 0.1:.1f}MB',
+                'processing_time': '中等',
+                'stability': '良好'
+            }
+        else:
+            return {
+                'recommended_method': 'match_batch_streaming',
+                'reason': '大批量数据，建议流式处理',
+                'expected_memory': f'~{min(1000, batch_size) * 0.1:.1f}MB (恒定)',
+                'processing_time': '较慢但稳定',
+                'stability': '优秀',
+                'recommended_batch_size': min(1000, batch_size // 10)
+            }
+
     def calculate_metrics(self, results: List[MatchResult]) -> Dict:
         """计算匹配指标"""
         total = len(results)
         success = sum(1 for r in results if r.success)
-        
+
         return {
             'total': total,
             'success': success,
