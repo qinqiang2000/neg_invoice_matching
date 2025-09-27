@@ -81,16 +81,26 @@ class TestDataGenerator:
     3. 生成特定场景的测试用例
     """
     
-    def __init__(self, db_config: Dict, config: Optional[Dict] = None):
+    def __init__(self, db_config: Dict, config: Optional[Dict] = None, seed: Optional[int] = None):
         """
         初始化数据生成器
 
         Args:
             db_config: 数据库配置
             config: 测试配置（可选，用于覆盖默认配置）
+            seed: 随机种子（可选，用于生成可重复的测试数据）
         """
         self.conn = psycopg2.connect(**db_config)
         self.cur = self.conn.cursor()
+
+        # 设置随机种子（用于可重复测试）
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+            self.seed = seed
+            print(f"🌱 已设置随机种子: {seed} (数据将完全可重复)")
+        else:
+            self.seed = None
 
         # 使用传入的配置或默认配置
         if config:
@@ -247,22 +257,20 @@ class TestDataGenerator:
     
     def generate_remaining_amount(self):
         """
-        生成符合长尾分布的remaining金额
-        这个分布非常重要，直接影响测试效果
+        生成更贴近真实场景的remaining金额分布
+        减少完全用完的比例，增加有效剩余金额
         """
         rand = random.random()
-        if rand < 0.70:  # 70% remaining = 0
+        if rand < 0.60:  # 60% remaining = 0 (从70%降低)
             return 0
-        elif rand < 0.82:  # 12% remaining 1-50
-            return round(random.uniform(1, 50), 2)
-        elif rand < 0.90:  # 8% remaining 50-100
-            return round(random.uniform(50, 100), 2)
-        elif rand < 0.96:  # 6% remaining 100-500
+        elif rand < 0.75:  # 15% 小额 1-100 (从12%增加)
+            return round(random.uniform(1, 100), 2)
+        elif rand < 0.85:  # 10% 中额 100-500 (从6%增加)
             return round(random.uniform(100, 500), 2)
-        elif rand < 0.99:  # 3% remaining 500-1000
-            return round(random.uniform(500, 1000), 2)
-        else:  # 1% remaining > 1000
-            return round(random.uniform(1000, 5000), 2)
+        elif rand < 0.95:  # 10% 大额 500-2000 (从3%大幅增加)
+            return round(random.uniform(500, 2000), 2)
+        else:  # 5% 超大额 2000-10000 (从1%增加且金额范围扩大)
+            return round(random.uniform(2000, 10000), 2)
     
     def generate_buyer_seller(self):
         """

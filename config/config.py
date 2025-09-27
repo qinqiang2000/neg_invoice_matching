@@ -2,6 +2,10 @@
 配置管理模块
 """
 
+# 动态候选限制配置
+DYNAMIC_LIMIT_BASE = 200      # 每个负数发票的基础候选数 (从150增加到200)
+DYNAMIC_LIMIT_MAX = 2000       # 单个条件的最大候选数 (从1000增加到2000)
+
 def get_db_config(env='test'):
     """
     获取数据库配置

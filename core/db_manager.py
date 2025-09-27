@@ -5,6 +5,7 @@ from typing import List, Optional, Dict
 from decimal import Decimal
 from .matching_engine import BlueLineItem, NegativeInvoice, MatchResult
 from .performance_monitor import get_performance_timer
+from config.config import DYNAMIC_LIMIT_BASE, DYNAMIC_LIMIT_MAX
 import logging
 
 logger = logging.getLogger(__name__)
@@ -136,8 +137,8 @@ class DatabaseManager:
 
                         # 动态计算该条件的limit
                         if group_counts and condition in group_counts:
-                            # 每个负数发票100个候选，最多500个
-                            actual_limit = min(100 * group_counts[condition], 500)
+                            # 使用配置的动态limit参数
+                            actual_limit = min(DYNAMIC_LIMIT_BASE * group_counts[condition], DYNAMIC_LIMIT_MAX)
                         else:
                             # 兼容模式：使用默认limit
                             actual_limit = limit

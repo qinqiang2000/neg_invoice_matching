@@ -4,6 +4,7 @@ from decimal import Decimal
 import logging
 import time
 import copy
+from config.config import DYNAMIC_LIMIT_BASE, DYNAMIC_LIMIT_MAX
 
 logger = logging.getLogger(__name__)
 
@@ -80,14 +81,16 @@ class GreedyMatchingEngine:
     核心业务逻辑，不依赖具体的数据库实现
     """
     
-    def __init__(self, fragment_threshold: Decimal = Decimal('5.0')):
+    def __init__(self, fragment_threshold: Decimal = Decimal('5.0'), debug_mode: bool = False):
         """
         初始化匹配引擎
-        
+
         Args:
             fragment_threshold: 碎片阈值，低于此值视为碎片
+            debug_mode: 调试模式，控制详细输出
         """
         self.fragment_threshold = fragment_threshold
+        self.debug_mode = debug_mode
         
     def match_single(self,
                     negative: NegativeInvoice,
@@ -349,6 +352,9 @@ class GreedyMatchingEngine:
         # 计算总执行时间
         execution_time = time.time() - start_time
 
+        # 分析匹配效率并输出统计
+        self._print_efficiency_stats(results)
+
         # 记录监控数据
         if enable_monitoring:
             try:
@@ -368,6 +374,41 @@ class GreedyMatchingEngine:
                 logger.warning(f"记录监控数据失败: {e}")
 
         return results
+
+    def _print_efficiency_stats(self, results: List[MatchResult]):
+        """分析并打印匹配效率统计（仅在调试模式下详细输出）"""
+        if not hasattr(self, '_candidate_fetch_stats'):
+            return
+
+        stats = self._candidate_fetch_stats
+        successful_results = [r for r in results if r.success]
+
+        if not successful_results:
+            if self.debug_mode:
+                print("📊 匹配效率: 无成功匹配，无法计算效率统计")
+            return
+
+        # 计算候选使用统计
+        total_candidates_used = sum(len(r.allocations) for r in successful_results)
+        total_fetched = stats['total_fetched']
+
+        # 计算提前退出统计（成功匹配中用到的候选数相对较少说明提前找到了足够金额）
+        avg_candidates_per_success = total_candidates_used / len(successful_results) if successful_results else 0
+        expected_candidates = stats['avg_per_negative']
+
+        # 计算效率指标
+        usage_rate = total_candidates_used / total_fetched if total_fetched > 0 else 0
+        efficiency_rate = 1.0 - (avg_candidates_per_success / expected_candidates) if expected_candidates > 0 else 0
+        waste_rate = 1.0 - usage_rate
+
+        # 总是输出最终汇总统计
+        print(f"📊 最终效率统计: 使用率{usage_rate:.1%}, 算法效率{max(0, efficiency_rate):.1%}, 成功率{len(successful_results)}/{len(results)} ({len(successful_results)/len(results):.1%})")
+
+        # 详细统计仅在调试模式下输出
+        if self.debug_mode:
+            print(f"📊 候选使用效率: 实际使用{total_candidates_used}/{total_fetched} ({usage_rate:.1%})")
+            print(f"📊 匹配效率: 平均{avg_candidates_per_success:.1f}个候选/成功匹配, 算法效率{max(0, efficiency_rate):.1%}")
+            print(f"📊 资源利用: 候选浪费率{waste_rate:.1%}, 成功率{len(successful_results)}/{len(results)} ({len(successful_results)/len(results):.1%})")
 
     def _group_negatives_by_conditions(self,
                                      negatives: List[NegativeInvoice]) -> Dict[tuple, List[tuple]]:
@@ -410,10 +451,26 @@ class GreedyMatchingEngine:
                 seller_ids = set(c[2] for c in conditions)
                 logger.info(f"不同税率数: {len(tax_rates)}, 买方数: {len(buyer_ids)}, 卖方数: {len(seller_ids)}")
 
+                # 统计组大小分布
+                group_sizes = list(group_counts.values())
+                if self.debug_mode:
+                    print(f"📊 组大小分布: 最小{min(group_sizes)}, 最大{max(group_sizes)}, 平均{sum(group_sizes)/len(group_sizes):.1f}")
+
                 # 统计动态limit信息
-                total_limit = sum(min(100 * count, 500) for count in group_counts.values())
+                total_limit = sum(min(DYNAMIC_LIMIT_BASE * count, DYNAMIC_LIMIT_MAX) for count in group_counts.values())
                 avg_limit = total_limit / len(group_counts) if group_counts else 0
-                logger.info(f"动态limit统计: 总计{total_limit}, 平均{avg_limit:.1f}, 最大{max(group_counts.values()) if group_counts else 0}个/组")
+                avg_candidates_per_negative = avg_limit / (sum(group_sizes) / len(group_sizes)) if group_sizes else 0
+                if self.debug_mode:
+                    print(f"📊 动态limit统计: 总计{total_limit}, 平均{avg_limit:.1f}, 每个负数发票平均{avg_candidates_per_negative:.1f}个候选")
+
+                # 记录候选预取信息，用于后续效率分析
+                self._candidate_fetch_stats = {
+                    'total_fetched': total_limit,
+                    'avg_per_negative': avg_candidates_per_negative,
+                    'total_negatives': sum(group_sizes)
+                }
+
+                logger.info(f"动态limit统计: 总计{total_limit}, 平均{avg_limit:.1f}, 每个负数发票平均{avg_candidates_per_negative:.1f}个候选")
 
             group_candidates = candidate_provider.db_manager.get_candidates_batch(conditions, group_counts=group_counts)
 

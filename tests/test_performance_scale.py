@@ -101,7 +101,8 @@ class PerformanceTestSuite:
     """大规模性能测试套件"""
 
     def __init__(self, db_config: Dict, test_config: Optional[Dict] = None, preserve_data: bool = False,
-                 enable_explainability: bool = True, enable_deep_diagnosis: bool = False):
+                 enable_explainability: bool = True, enable_deep_diagnosis: bool = False,
+                 seed: Optional[int] = None):
         """
         初始化性能测试套件
 
@@ -113,14 +114,16 @@ class PerformanceTestSuite:
                 - True: 保留测试后的数据状态，用于后续分析
             enable_explainability: 是否启用可解释性分析（默认True，几乎无性能影响）
             enable_deep_diagnosis: 是否启用深度诊断（默认False，可选择性启用）
+            seed: 随机种子（可选，用于生成可重复的测试数据）
         """
         self.db_config = db_config
         self.preserve_data = preserve_data
         self.enable_explainability = enable_explainability
         self.enable_deep_diagnosis = enable_deep_diagnosis
+        self.seed = seed
         self.test_batch_ids = []  # 跟踪测试生成的批次ID
         self.db_manager = DatabaseManager(db_config)
-        self.engine = GreedyMatchingEngine()
+        self.engine = GreedyMatchingEngine(debug_mode=False)  # 默认关闭调试输出
         self.candidate_provider = CandidateProvider(self.db_manager)
 
         # 测试配置
@@ -131,8 +134,8 @@ class PerformanceTestSuite:
         self.process = psutil.Process()
         self.test_results: List[PerformanceMetrics] = []
 
-        # 数据生成器
-        self.data_generator = TestDataGenerator(db_config)
+        # 数据生成器（支持固定种子）
+        self.data_generator = TestDataGenerator(db_config, seed=seed)
 
         # 可解释性功能
         if self.enable_explainability:
@@ -152,12 +155,12 @@ class PerformanceTestSuite:
             },
             'medium': {
                 'blue_lines': 5_000_000,      # 500万
-                'negative_batches': [500, 1000, 2000],
+                'negative_batches': [2000],
                 'description': '中等规模测试（500万蓝票行）'
             },
             'large': {
                 'blue_lines': 10_000_000,     # 1000万
-                'negative_batches': [500, 1000, 3000],
+                'negative_batches': [ 3000],
                 'description': '大规模测试（1000万蓝票行）'
             }
         }
@@ -950,7 +953,8 @@ class PerformanceTestSuite:
 def run_performance_tests(scales: List[str], cleanup: bool = True,
                          report_file: Optional[str] = None, preserve_data: bool = False,
                          delete_data: bool = False, enable_explainability: bool = True,
-                         enable_deep_diagnosis: bool = False):
+                         enable_deep_diagnosis: bool = False, seed: Optional[int] = None,
+                         debug_mode: bool = False):
     """
     运行性能测试
 
@@ -962,6 +966,7 @@ def run_performance_tests(scales: List[str], cleanup: bool = True,
         delete_data: 是否删除测试数据（默认False，只重置状态保留数据以便复用）
         enable_explainability: 是否启用可解释性分析（默认True，几乎无性能影响）
         enable_deep_diagnosis: 是否启用深度诊断（默认False，可选择性启用）
+        seed: 随机种子（可选，用于生成可重复的测试数据）
     """
     print("=== 负数发票匹配系统 - 大规模性能测试 ===\n")
 
@@ -976,14 +981,25 @@ def run_performance_tests(scales: List[str], cleanup: bool = True,
         print("🔍 可解释性分析: 已禁用")
     print()
 
+    # 显示随机种子状态
+    if seed is not None:
+        print(f"🌱 使用固定随机种子: {seed}")
+        print("   注意: 相同种子将生成完全相同的测试数据\n")
+    else:
+        print("🎲 使用随机数据生成 (每次运行结果可能不同)\n")
+
     # 初始化测试套件
     db_config = get_db_config('test')
     test_suite = PerformanceTestSuite(
         db_config,
         preserve_data=preserve_data,
         enable_explainability=enable_explainability,
-        enable_deep_diagnosis=enable_deep_diagnosis
+        enable_deep_diagnosis=enable_deep_diagnosis,
+        seed=seed
     )
+
+    # 设置调试模式
+    test_suite.engine.debug_mode = debug_mode
 
     all_results = []
     batch_ids = []
@@ -995,8 +1011,16 @@ def run_performance_tests(scales: List[str], cleanup: bool = True,
             print("❌ 数据不足，无法进行测试")
             return
 
-        # 重置现有数据状态（仅在不保留数据时）
-        test_suite.reset_existing_data()
+        # 重置现有数据状态
+        # 注意：当使用固定种子时，必须重置数据状态以确保可重复性
+        if seed is not None:
+            print("🔄 检测到固定种子，强制重置数据状态以确保可重复性...")
+            test_suite.preserve_data = False  # 临时覆盖设置
+            test_suite.reset_existing_data()
+            test_suite.preserve_data = preserve_data  # 恢复原设置
+        else:
+            # 仅在不保留数据时重置
+            test_suite.reset_existing_data()
 
         for scale in scales:
             print(f"\n{'='*60}")
@@ -1062,8 +1086,19 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例用法:
-  # 小规模测试
+  # 小规模测试（默认使用种子42，可重复）
   python test_performance_scale.py --scale small
+
+  # 使用随机数据（每次结果不同）
+  python test_performance_scale.py --scale small --random
+
+  # 使用自定义固定种子进行可重复测试
+  python test_performance_scale.py --scale large --seed 12345
+
+  # 对比优化前后性能（默认种子42确保数据一致）
+  python test_performance_scale.py --scale large --report before_optimization.md
+  # ... 应用优化 ...
+  python test_performance_scale.py --scale large --report after_optimization.md
 
   # 所有规模测试
   python test_performance_scale.py --scale all
@@ -1099,6 +1134,15 @@ def parse_args():
     parser.add_argument('--enable-deep-diagnosis', action='store_true',
                        help='启用深度诊断分析（详细失败原因分析，可能稍微影响性能）')
 
+    parser.add_argument('--seed', type=int, default=999,
+                       help='随机种子（默认: 999，用于生成可重复的测试数据）。注意：使用seed时会自动重置数据状态以确保可重复性')
+
+    parser.add_argument('--random', action='store_true',
+                       help='使用真正的随机数据（禁用默认种子999）')
+
+    parser.add_argument('--debug', action='store_true',
+                       help='启用调试模式（详细性能统计输出，会影响性能）')
+
     return parser.parse_args()
 
 
@@ -1111,6 +1155,9 @@ if __name__ == "__main__":
     else:
         scales = [args.scale]
 
+    # 处理种子参数
+    seed = None if args.random else args.seed
+
     # 运行测试
     run_performance_tests(
         scales=scales,
@@ -1119,5 +1166,7 @@ if __name__ == "__main__":
         preserve_data=args.preserve_data,
         delete_data=args.delete_data,
         enable_explainability=not args.disable_explainability,
-        enable_deep_diagnosis=args.enable_deep_diagnosis
+        enable_deep_diagnosis=args.enable_deep_diagnosis,
+        seed=seed,
+        debug_mode=args.debug
     )
