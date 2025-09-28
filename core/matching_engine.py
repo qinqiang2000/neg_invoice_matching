@@ -346,7 +346,7 @@ class GreedyMatchingEngine:
             group_results = self._match_group(group_negatives, candidates, sort_strategy)
 
             # 将结果放回原始位置
-            for (original_index, _), result in zip(group_negatives, group_results):
+            for original_index, result in group_results.items():
                 results[original_index] = result
 
         # 计算总执行时间
@@ -498,16 +498,19 @@ class GreedyMatchingEngine:
     def _match_group(self,
                     group_negatives: List[tuple],
                     candidates: List[BlueLineItem],
-                    sort_strategy: str) -> List[MatchResult]:
+                    sort_strategy: str) -> Dict[int, MatchResult]:
         """
         匹配单个组内的负数发票
         需要实时更新候选集的remaining值，避免重复分配
+
+        Returns:
+            Dict[int, MatchResult]: 键为original_index，值为匹配结果
         """
         # 组内排序
         sorted_group = sorted(group_negatives,
                             key=lambda x: self._get_sort_key(x[1], sort_strategy))
 
-        results = []
+        results = {}
         # 创建候选集的深拷贝以实时更新remaining
         local_candidates = {c.line_id: copy.deepcopy(c) for c in candidates}
 
@@ -523,7 +526,7 @@ class GreedyMatchingEngine:
 
             # 执行匹配
             result = self.match_single(negative, available_candidates)
-            results.append(result)
+            results[original_index] = result
 
             # 实时更新本地候选集的remaining值
             if result.success:

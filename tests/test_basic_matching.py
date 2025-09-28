@@ -154,35 +154,21 @@ def reset_specific_test_changes(db_manager, batch_id):
 
 def print_detailed_results_with_candidates(invoices, results, candidate_provider, elapsed):
     """输出详细匹配结果（包含候选集信息）"""
-    print("=== 详细匹配结果（含候选集信息） ===")
+    print("=== 详细匹配结果 ===")
 
     for i, (invoice, result) in enumerate(zip(invoices, results)):
         print(f"\n{i+1}. 负数发票 {invoice.invoice_id}:")
         print(f"   输入: 金额={invoice.amount}, 税率={invoice.tax_rate}%, "
               f"买方={invoice.buyer_id}, 卖方={invoice.seller_id}")
 
-        # 获取候选集
-        candidates = candidate_provider.get_candidates(invoice.tax_rate, invoice.buyer_id, invoice.seller_id)
-        print(f"   候选集: 找到 {len(candidates)} 个候选蓝票行")
-
-        if candidates:
-            print(f"   候选集详情:")
-            total_candidate_amount = sum(c.remaining for c in candidates)
-            print(f"     - 总可用金额: {total_candidate_amount}")
-            print(f"     - 前5个候选项:")
-            for j, candidate in enumerate(candidates[:5], 1):
-                print(f"       {j}) ID={candidate.line_id}, 余额={candidate.remaining}")
-            if len(candidates) > 5:
-                print(f"       ... 还有 {len(candidates) - 5} 个候选项")
-        else:
-            print(f"   ⚠️  无候选集 - 无法匹配")
-
         if result.success:
             print(f"   ✓ 匹配成功 - 总匹配金额: {result.total_matched}")
             print(f"   最终分配 ({len(result.allocations)} 个蓝票行):")
-            for j, alloc in enumerate(result.allocations, 1):
+            for j, alloc in enumerate(result.allocations[:10], 1):  # 只显示前10个分配
                 print(f"     {j}) 蓝票行 {alloc.blue_line_id}: "
                       f"使用 {alloc.amount_used}, 剩余 {alloc.remaining_after}")
+            if len(result.allocations) > 10:
+                print(f"     ... 还有 {len(result.allocations) - 10} 个分配")
             if result.fragments_created > 0:
                 print(f"   ⚠️  产生碎片: {result.fragments_created} 个")
         else:
